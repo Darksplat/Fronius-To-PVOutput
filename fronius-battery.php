@@ -1,9 +1,21 @@
 <?php
 // -----------------------------------------------------------------------------
-// Fronius GEN24 + Smart Meter → PVOutput uploader (BATTERY TEST SCRIPT)
+// Fronius GEN24 + Smart Meter → PVOutput uploader (BATTERY)
 //
-// Battery reporting uses PVOutput BATTERY FIELDS (b1 / b2)
-// A PVOutput DONATION ACCOUNT IS REQUIRED for battery data
+// Core upload is PVOutput FREE-TIER SAFE:
+//   v1 = Energy Generation (Wh, cumulative today)
+//   v2 = Power Generation (W)
+//   v3 = Energy Consumption (Wh, cumulative today)
+//   v4 = Power Consumption (W)
+//   v6 = Voltage (V)
+//   c1 = Cumulative flag
+//
+// Battery upload is PVOutput DONATION-ONLY and uses BATTERY FIELDS (not v10/v11):
+//   b1 = Battery Power (W)    +ve charge, -ve discharge
+//   b2 = Battery SOC (%)
+//
+// Not used (donation-only extended values):
+//   v7–v12, v8, v9
 // -----------------------------------------------------------------------------
 
 // ======================= USER CONFIG =======================
@@ -15,19 +27,24 @@ $ipAddress = 'PUT_YOUR_INVERTER_IP_ADDRESS_HERE';
 $pvoutputAPIKey   = 'PUT_YOUR_PVOUTPUT_API_KEY_HERE';
 $pvoutputSystemId = 'PUT_YOUR_PVOUTPUT_SYSTEM_ID_HERE';
 
-// ======================= OPTIONAL FEATURES =======================
-
-// Set to true ONLY if you have a battery installed
-$ENABLE_BATTERY = false;
-
-// Set to true ONLY if your PVOutput account is a DONATION account
-$PVOUTPUT_DONOR = false;
-
 // Set to true to enable debug logging
 $DEBUG = false;
 
+// IMPORTANT: For your Smart Meter
+// Negative PowerReal_P_Sum = importing from grid
+// Positive PowerReal_P_Sum = exporting to grid
+$INVERT_METER_POWER = true;
+
+// ----------------------- BATTERY OPTIONS --------------------------------------
+
+// Set to true ONLY if you have a battery installed and want to read Fronius storage data
+$ENABLE_BATTERY = false;
+
+// Set to true ONLY if your PVOutput account is a DONATION account (required for b1/b2)
+$PVOUTPUT_DONOR = false;
+
 // ======================= INTERNAL CONFIG =======================
-$inverterId  = 1;
+$inverterId  = 1;   // Standard single inverter ID = 1
 $lockFile    = __DIR__ . '/fronius-battery.lock';
 $logFile     = __DIR__ . '/fronius-battery.log';
 $httpTimeout = 10;
@@ -83,7 +100,7 @@ $time = date('H:i');
 try {
 
     // -------------------------------------------------------------------------
-    // INVERTER REALTIME DATA
+    // INVERTER REALTIME DATA (POWER, VOLTAGE)
     // -------------------------------------------------------------------------
     $inv = httpGetJson(
         "http://{$ipAddress}/solar_api/v1/GetInverterRealtimeData.cgi" .
@@ -93,32 +110,30 @@ try {
 
     $invData = $inv['Body']['Data'] ?? null;
     if (!is_array($invData)) {
-        throw new RuntimeException('Missing inverter data');
+        throw new RuntimeException('Missing inverter realtime data');
     }
 
-    $powerGeneration = (int) ($invData['PAC']['Value'] ?? 0);
-    $voltage   = $invData['UAC']['Value'] ?? null;
-    $frequency = $invData['FAC']['Value'] ?? null;
+    $pvPowerW = (int) ($invData['PAC']['Value'] ?? 0);
+    $voltageV = $invData['UAC']['Value'] ?? null;
 
     // -------------------------------------------------------------------------
-    // INVERTER DAILY ENERGY
+    // INVERTER DAILY ENERGY (GENERATION)
     // -------------------------------------------------------------------------
-    $energy = httpGetJson(
+    $invEnergy = httpGetJson(
         "http://{$ipAddress}/solar_api/v1/GetInverterRealtimeData.cgi" .
         "?Scope=Device&DeviceID={$inverterId}&DataCollection=EnergyReal_WAC_Sum_Day",
         $httpTimeout
     );
 
-    $energyToday = (int) (
-        $energy['Body']['Data']['EnergyReal_WAC_Sum_Day']['Value'] ?? 0
+    $pvEnergyWh = (int) (
+        $invEnergy['Body']['Data']['EnergyReal_WAC_Sum_Day']['Value'] ?? 0
     );
 
     // -------------------------------------------------------------------------
-    // SMART METER DATA
+    // SMART METER DATA (GRID POWER + ENERGY)
     // -------------------------------------------------------------------------
     $meter = httpGetJson(
-        "http://{$ipAddress}/solar_api/v1/GetMeterRealtimeData.cgi" .
-        "?Scope=Device&DeviceId=0",
+        "http://{$ipAddress}/solar_api/v1/GetMeterRealtimeData.cgi?Scope=Device&DeviceId=0",
         $httpTimeout
     );
 
@@ -127,18 +142,38 @@ try {
         throw new RuntimeException('Missing meter data');
     }
 
-    $rawGridPower = (int) ($m['PowerReal_P_Sum']['Value'] ?? 0);
-    $powerConsumption = max(0, $rawGridPower);
-    $netGridPower     = -$rawGridPower;
-    $energyConsumedToday = (int) (
-        $m['EnergyReal_WAC_Sum_Consumed_Day']['Value'] ?? 0
-    );
+    $gridPowerW = (int) ($m['PowerReal_P_Sum']['Value'] ?? 0);
+    if ($INVERT_METER_POWER === true) {
+        $gridPowerW *= -1;
+    }
+
+    $importWh = isset($m['EnergyReal_WAC_Sum_Consumed_Day']['Value'])
+        ? (int) $m['EnergyReal_WAC_Sum_Consumed_Day']['Value']
+        : null;
+
+    $exportWh = isset($m['EnergyReal_WAC_Sum_Produced_Day']['Value'])
+        ? (int) $m['EnergyReal_WAC_Sum_Produced_Day']['Value']
+        : null;
 
     // -------------------------------------------------------------------------
-    // BATTERY DATA (OPTIONAL, DONOR ONLY)
+    // CALCULATE HOUSE LOAD (NON-BATTERY FORMULA)
     // -------------------------------------------------------------------------
-    $batteryPower = null;
-    $batterySOC   = null;
+    // Power: load_W = pv_W + grid_W
+    $loadPowerW = $pvPowerW + $gridPowerW;
+    if ($loadPowerW < 0) $loadPowerW = 0;
+
+    // Energy: load_Wh = pv_Wh + import_Wh - export_Wh  (requires both)
+    $loadEnergyWh = null;
+    if ($importWh !== null && $exportWh !== null) {
+        $loadEnergyWh = $pvEnergyWh + $importWh - $exportWh;
+        if ($loadEnergyWh < 0) $loadEnergyWh = 0;
+    }
+
+    // -------------------------------------------------------------------------
+    // BATTERY DATA (DONATION-ONLY IN PVOUTPUT)
+    // -------------------------------------------------------------------------
+    $batteryPowerW = null;
+    $batterySOC    = null;
 
     if ($ENABLE_BATTERY === true && $PVOUTPUT_DONOR === true) {
 
@@ -150,11 +185,10 @@ try {
         $s = $storage['Body']['Data'] ?? null;
 
         if (is_array($s)) {
-
-            // Fronius: +ve = discharge, -ve = charge
-            // PVOutput: +ve = charge, -ve = discharge
+            // Fronius: +ve discharge, -ve charge
+            // PVOutput b1: +ve charge, -ve discharge
             if (isset($s['P'])) {
-                $batteryPower = (int) round(-$s['P']);
+                $batteryPowerW = (int) round(-$s['P']);
             }
 
             if (isset($s['SOC'])) {
@@ -164,33 +198,40 @@ try {
                 }
             }
 
-            logMsg('Battery data detected: ' . json_encode($s), true);
+            logMsg('Battery data: ' . json_encode($s), true);
         }
+
+    } elseif ($ENABLE_BATTERY === true && $PVOUTPUT_DONOR !== true) {
+        // Avoid user confusion: battery enabled locally but cannot be uploaded to PVOutput without donation
+        logMsg('Battery enabled but PVOUTPUT_DONOR=false. Battery fields (b1/b2) will not be sent.');
     }
 
     // -------------------------------------------------------------------------
-    // PVOUTPUT PAYLOAD
+    // PVOUTPUT PAYLOAD (FREE-TIER CORE + OPTIONAL BATTERY)
     // -------------------------------------------------------------------------
     $data = [
         'd'  => $date,
         't'  => $time,
-        'v2' => $powerGeneration,
-        'v3' => $energyToday,
-        'v4' => $powerConsumption,
-        'v8' => $netGridPower,
-        'v9' => $energyConsumedToday,
+        'v1' => $pvEnergyWh,  // cumulative generation today
+        'v2' => $pvPowerW,    // instantaneous generation
+        'v4' => $loadPowerW,  // instantaneous consumption
+        'c1' => 1,            // v1 and v3 are cumulative
     ];
 
-    if ($voltage !== null)   $data['v6'] = round($voltage, 1);
-    if ($frequency !== null) $data['v7'] = round($frequency, 2);
-
-    // 🔋 Battery → PVOutput (DONOR accounts only)
-    if ($batteryPower !== null) {
-        $data['b1'] = $batteryPower;   // Battery power (W)
+    if ($loadEnergyWh !== null) {
+        $data['v3'] = $loadEnergyWh; // cumulative consumption today
     }
 
+    if ($voltageV !== null) {
+        $data['v6'] = round((float) $voltageV, 1);
+    }
+
+    // Battery → PVOutput (DONOR ONLY)
+    if ($batteryPowerW !== null) {
+        $data['b1'] = $batteryPowerW;
+    }
     if ($batterySOC !== null) {
-        $data['b2'] = $batterySOC;     // Battery SOC (%)
+        $data['b2'] = $batterySOC;
     }
 
     logMsg('PVOutput payload: ' . json_encode($data), true);
