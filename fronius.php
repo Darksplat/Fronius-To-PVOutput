@@ -1,21 +1,19 @@
 <?php
 // -----------------------------------------------------------------------------
-// Fronius GEN24 + Smart Meter → PVOutput uploader (STANDARD, FREE-TIER SAFE)
+// Fronius GEN24 + Smart Meter → PVOutput uploader (STANDARD)
 //
-// PVOutput FREE fields used only:
-//   v1 = Energy Generation (Wh)
+// PVOutput FREE-TIER fields used ONLY:
+//   v1 = Energy Generation (Wh, cumulative today)
 //   v2 = Power Generation (W)
-//   v3 = Energy Consumption (Wh)
+//   v3 = Energy Consumption (Wh, cumulative today)
 //   v4 = Power Consumption (W)
 //   v6 = Voltage (V)
+//   c1 = Cumulative flag
 //
-// Not used (donation-only):
+// NOT USED (donation-only):
 //   v7–v12, v8, v9, any battery fields (b1–b6)
 //
-// Notes:
-// - Consumption POWER is calculated as: load_W = pv_W + grid_W
-// - Consumption ENERGY is calculated as: load_Wh = pv_Wh + import_Wh - export_Wh
-// - This is correct for non-battery systems. For batteries use fronius-battery.php.
+// This script is correct for NON-BATTERY systems.
 // -----------------------------------------------------------------------------
 
 // ======================= USER CONFIG =======================
@@ -30,12 +28,13 @@ $pvoutputSystemId = 'PUT_YOUR_PVOUTPUT_SYSTEM_ID_HERE';
 // Set to true to enable debug logging
 $DEBUG = false;
 
-// If your meter power sign is reversed, set this to true.
-// Expected (typical): PowerReal_P_Sum > 0 = importing from grid, < 0 = exporting to grid.
-$INVERT_METER_POWER = false;
+// IMPORTANT: For your Smart Meter
+// Negative PowerReal_P_Sum = importing from grid
+// Positive PowerReal_P_Sum = exporting to grid
+$INVERT_METER_POWER = true;
 
 // ======================= INTERNAL CONFIG =======================
-$inverterId  = 1;   // Standard script assumes a single inverter with ID 1
+$inverterId  = 1;   // Standard script assumes single inverter ID = 1
 $lockFile    = __DIR__ . '/fronius.lock';
 $logFile     = __DIR__ . '/fronius.log';
 $httpTimeout = 10;
@@ -91,7 +90,7 @@ $time = date('H:i');
 try {
 
     // -------------------------------------------------------------------------
-    // INVERTER REALTIME (POWER, VOLTAGE)
+    // INVERTER REALTIME DATA (POWER, VOLTAGE)
     // -------------------------------------------------------------------------
     $inv = httpGetJson(
         "http://{$ipAddress}/solar_api/v1/GetInverterRealtimeData.cgi" .
@@ -121,7 +120,7 @@ try {
     );
 
     // -------------------------------------------------------------------------
-    // SMART METER (GRID POWER + IMPORT/EXPORT ENERGY)
+    // SMART METER DATA (GRID POWER + ENERGY)
     // -------------------------------------------------------------------------
     $meter = httpGetJson(
         "http://{$ipAddress}/solar_api/v1/GetMeterRealtimeData.cgi?Scope=Device&DeviceId=0",
@@ -133,13 +132,13 @@ try {
         throw new RuntimeException('Missing meter data');
     }
 
-    // Grid power (W): +import / -export (typical)
+    // Grid power (invert for this installation)
     $gridPowerW = (int) ($m['PowerReal_P_Sum']['Value'] ?? 0);
     if ($INVERT_METER_POWER === true) {
         $gridPowerW *= -1;
     }
 
-    // Import/export energy (Wh) for today (if available)
+    // Grid energy (cumulative today)
     $importWh = isset($m['EnergyReal_WAC_Sum_Consumed_Day']['Value'])
         ? (int) $m['EnergyReal_WAC_Sum_Consumed_Day']['Value']
         : null;
@@ -149,22 +148,17 @@ try {
         : null;
 
     // -------------------------------------------------------------------------
-    // CALCULATE CONSUMPTION (LOAD)
+    // CALCULATE HOUSE LOAD
     // -------------------------------------------------------------------------
-    // Power: load_W = pv_W + grid_W
-    // (grid_W positive import adds to load; grid_W negative export reduces available PV for load)
+    // Instantaneous load power
     $loadPowerW = $pvPowerW + $gridPowerW;
-    if ($loadPowerW < 0) $loadPowerW = 0; // clamp to 0 for safety
+    if ($loadPowerW < 0) $loadPowerW = 0;
 
-    // Energy: load_Wh = pv_Wh + import_Wh - export_Wh (if we have both)
+    // Cumulative load energy (today)
     $loadEnergyWh = null;
     if ($importWh !== null && $exportWh !== null) {
         $loadEnergyWh = $pvEnergyWh + $importWh - $exportWh;
         if ($loadEnergyWh < 0) $loadEnergyWh = 0;
-    } elseif ($importWh !== null) {
-        // Fallback (less ideal): at least report grid import as a proxy
-        // Keeping it non-null helps users who do not have export/day available.
-        $loadEnergyWh = $importWh;
     }
 
     // -------------------------------------------------------------------------
@@ -173,13 +167,14 @@ try {
     $data = [
         'd'  => $date,
         't'  => $time,
-        'v1' => $pvEnergyWh,
-        'v2' => $pvPowerW,
-        'v4' => $loadPowerW,
+        'v1' => $pvEnergyWh,   // cumulative generation today
+        'v2' => $pvPowerW,     // instantaneous generation
+        'v4' => $loadPowerW,   // instantaneous consumption
+        'c1' => 1,             // v1 and v3 are cumulative
     ];
 
     if ($loadEnergyWh !== null) {
-        $data['v3'] = $loadEnergyWh;
+        $data['v3'] = $loadEnergyWh;  // cumulative consumption today
     }
 
     if ($voltageV !== null) {
@@ -202,8 +197,11 @@ try {
         ]
     ]);
 
-    $result = @file_get_contents('https://pvoutput.org/service/r2/addstatus.jsp', false, $context);
-    if ($result === false) {
+    if (@file_get_contents(
+        'https://pvoutput.org/service/r2/addstatus.jsp',
+        false,
+        $context
+    ) === false) {
         throw new RuntimeException('PVOutput upload failed');
     }
 
