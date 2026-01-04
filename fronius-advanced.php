@@ -1,8 +1,21 @@
 <?php
 // -----------------------------------------------------------------------------
 // Fronius GEN24 + Smart Meter → PVOutput uploader (ADVANCED)
-// - Auto-detect inverter IDs
-// - Supports multiple inverters
+//
+// - Auto-detects all running inverters
+// - Aggregates generation across multiple inverters
+// - Uses Smart Meter to derive household consumption
+//
+// PVOutput FREE-TIER fields used ONLY:
+//   v1 = Energy Generation (Wh, cumulative today)
+//   v2 = Power Generation (W)
+//   v3 = Energy Consumption (Wh, cumulative today)
+//   v4 = Power Consumption (W)
+//   v6 = Voltage (V)
+//   c1 = Cumulative flag
+//
+// NOT USED (donation-only):
+//   v7–v12, v8, v9, any battery fields (b1–b6)
 // -----------------------------------------------------------------------------
 
 // ======================= USER CONFIG =======================
@@ -14,29 +27,25 @@ $ipAddress = 'PUT_YOUR_INVERTER_IP_ADDRESS_HERE';
 $pvoutputAPIKey   = 'PUT_YOUR_PVOUTPUT_API_KEY_HERE';
 $pvoutputSystemId = 'PUT_YOUR_PVOUTPUT_SYSTEM_ID_HERE';
 
-// ======================= OPTIONAL FEATURES =======================
-
 // Set to true to enable debug logging
 $DEBUG = false;
 
-// Battery support scaffold (advanced users only)
-// Set to true ONLY if you have a battery installed
-$ENABLE_BATTERY = false;
+// IMPORTANT: For your Smart Meter
+// Negative PowerReal_P_Sum = importing from grid
+// Positive PowerReal_P_Sum = exporting to grid
+$INVERT_METER_POWER = true;
 
 // ======================= INTERNAL CONFIG =======================
 $lockFile    = __DIR__ . '/fronius-advanced.lock';
 $logFile     = __DIR__ . '/fronius-advanced.log';
 $httpTimeout = 10;
 
-
 // ---------------- HELPERS -----------------------------------------------------
 function logMsg(string $msg, bool $debugOnly = false): void
 {
-    if ($debugOnly && !DEBUG) {
-        return;
-    }
+    global $DEBUG, $logFile;
+    if ($debugOnly && $DEBUG !== true) return;
 
-    global $logFile;
     file_put_contents(
         $logFile,
         '[' . date('Y-m-d H:i:s') . '] ' . $msg . PHP_EOL,
@@ -52,12 +61,12 @@ function httpGetJson(string $url, int $timeout): array
 
     $json = @file_get_contents($url, false, $context);
     if ($json === false) {
-        throw new RuntimeException("HTTP fetch failed: {$url}");
+        throw new RuntimeException("HTTP failed: {$url}");
     }
 
     $data = json_decode($json, true);
     if (!is_array($data)) {
-        throw new RuntimeException("Invalid JSON from: {$url}");
+        throw new RuntimeException("Invalid JSON: {$url}");
     }
 
     return $data;
@@ -78,7 +87,7 @@ register_shutdown_function(function () use ($lockHandle) {
 $date = date('Ymd');
 $time = date('H:i');
 
-// ---------------- MAIN LOGIC --------------------------------------------------
+// ---------------- MAIN --------------------------------------------------------
 try {
 
     // -------------------------------------------------------------------------
@@ -94,10 +103,9 @@ try {
         throw new RuntimeException('No inverters detected');
     }
 
-    $totalPowerGeneration = 0;
-    $totalEnergyToday     = 0;
-    $voltageSamples       = [];
-    $frequencySamples     = [];
+    $totalPvPowerW  = 0;
+    $totalPvEnergyWh = 0;
+    $voltageSamples = [];
 
     foreach ($devices as $deviceId => $device) {
 
@@ -106,88 +114,99 @@ try {
             continue;
         }
 
-        // Instantaneous power
-        $powerData = httpGetJson(
+        // Inverter realtime power
+        $inv = httpGetJson(
             "http://{$ipAddress}/solar_api/v1/GetInverterRealtimeData.cgi" .
             "?Scope=Device&DeviceID={$deviceId}&DataCollection=CommonInverterData",
             $httpTimeout
         );
 
-        $p = $powerData['Body']['Data'] ?? null;
-        if ($p === null) {
-            continue;
+        $invData = $inv['Body']['Data'] ?? null;
+        if (!is_array($invData)) continue;
+
+        $totalPvPowerW += (int) ($invData['PAC']['Value'] ?? 0);
+
+        if (isset($invData['UAC']['Value'])) {
+            $voltageSamples[] = $invData['UAC']['Value'];
         }
 
-        $totalPowerGeneration += (int) ($p['PAC']['Value'] ?? 0);
-
-        if (isset($p['UAC']['Value'])) {
-            $voltageSamples[] = $p['UAC']['Value'];
-        }
-        if (isset($p['FAC']['Value'])) {
-            $frequencySamples[] = $p['FAC']['Value'];
-        }
-
-        // Daily energy
-        $energyData = httpGetJson(
+        // Inverter daily energy
+        $invEnergy = httpGetJson(
             "http://{$ipAddress}/solar_api/v1/GetInverterRealtimeData.cgi" .
             "?Scope=Device&DeviceID={$deviceId}&DataCollection=EnergyReal_WAC_Sum_Day",
             $httpTimeout
         );
 
-        $totalEnergyToday += (int) (
-            $energyData['Body']['Data']['EnergyReal_WAC_Sum_Day']['Value'] ?? 0
+        $totalPvEnergyWh += (int) (
+            $invEnergy['Body']['Data']['EnergyReal_WAC_Sum_Day']['Value'] ?? 0
         );
     }
 
-    if ($totalPowerGeneration === 0 && $totalEnergyToday === 0) {
-        throw new RuntimeException('No active inverters producing data');
+    if ($totalPvPowerW === 0 && $totalPvEnergyWh === 0) {
+        throw new RuntimeException('No active inverter data');
     }
 
-    $voltage   = !empty($voltageSamples)
+    $voltageV = !empty($voltageSamples)
         ? round(array_sum($voltageSamples) / count($voltageSamples), 1)
         : null;
 
-    $frequency = !empty($frequencySamples)
-        ? round(array_sum($frequencySamples) / count($frequencySamples), 2)
-        : null;
-
     // -------------------------------------------------------------------------
-    // SMART METER
+    // SMART METER DATA
     // -------------------------------------------------------------------------
     $meter = httpGetJson(
-        "http://{$ipAddress}/solar_api/v1/GetMeterRealtimeData.cgi" .
-        "?Scope=Device&DeviceId=0",
+        "http://{$ipAddress}/solar_api/v1/GetMeterRealtimeData.cgi?Scope=Device&DeviceId=0",
         $httpTimeout
     );
 
-    $meterData = $meter['Body']['Data'] ?? null;
-    if ($meterData === null) {
+    $m = $meter['Body']['Data'] ?? null;
+    if (!is_array($m)) {
         throw new RuntimeException('Missing meter data');
     }
 
-    $rawGridPower = (int) ($meterData['PowerReal_P_Sum']['Value'] ?? 0);
+    $gridPowerW = (int) ($m['PowerReal_P_Sum']['Value'] ?? 0);
+    if ($INVERT_METER_POWER === true) {
+        $gridPowerW *= -1;
+    }
 
-    $powerConsumption    = max(0, $rawGridPower);
-    $netGridPower        = -$rawGridPower;
-    $energyConsumedToday = (int) (
-        $meterData['EnergyReal_WAC_Sum_Consumed_Day']['Value'] ?? 0
-    );
+    $importWh = isset($m['EnergyReal_WAC_Sum_Consumed_Day']['Value'])
+        ? (int) $m['EnergyReal_WAC_Sum_Consumed_Day']['Value']
+        : null;
+
+    $exportWh = isset($m['EnergyReal_WAC_Sum_Produced_Day']['Value'])
+        ? (int) $m['EnergyReal_WAC_Sum_Produced_Day']['Value']
+        : null;
 
     // -------------------------------------------------------------------------
-    // PVOUTPUT PAYLOAD
+    // CALCULATE HOUSE LOAD
+    // -------------------------------------------------------------------------
+    $loadPowerW = $totalPvPowerW + $gridPowerW;
+    if ($loadPowerW < 0) $loadPowerW = 0;
+
+    $loadEnergyWh = null;
+    if ($importWh !== null && $exportWh !== null) {
+        $loadEnergyWh = $totalPvEnergyWh + $importWh - $exportWh;
+        if ($loadEnergyWh < 0) $loadEnergyWh = 0;
+    }
+
+    // -------------------------------------------------------------------------
+    // PVOUTPUT PAYLOAD (FREE-TIER SAFE)
     // -------------------------------------------------------------------------
     $data = [
         'd'  => $date,
         't'  => $time,
-        'v2' => $totalPowerGeneration,
-        'v3' => $totalEnergyToday,
-        'v4' => $powerConsumption,
-        'v8' => $netGridPower,
-        'v9' => $energyConsumedToday,
+        'v1' => $totalPvEnergyWh,
+        'v2' => $totalPvPowerW,
+        'v4' => $loadPowerW,
+        'c1' => 1,
     ];
 
-    if ($voltage !== null)   $data['v6'] = $voltage;
-    if ($frequency !== null) $data['v7'] = $frequency;
+    if ($loadEnergyWh !== null) {
+        $data['v3'] = $loadEnergyWh;
+    }
+
+    if ($voltageV !== null) {
+        $data['v6'] = $voltageV;
+    }
 
     logMsg('PVOutput payload: ' . json_encode($data), true);
 
@@ -205,17 +224,13 @@ try {
         ]
     ]);
 
-    $result = @file_get_contents(
+    if (@file_get_contents(
         'https://pvoutput.org/service/r2/addstatus.jsp',
         false,
         $context
-    );
-
-    if ($result === false) {
+    ) === false) {
         throw new RuntimeException('PVOutput upload failed');
     }
-
-    logMsg('PVOutput upload OK', true);
 
 } catch (Throwable $e) {
     logMsg('ERROR: ' . $e->getMessage());
