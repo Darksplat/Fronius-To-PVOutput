@@ -1,8 +1,9 @@
 <?php
 // -----------------------------------------------------------------------------
 // Fronius GEN24 + Smart Meter → PVOutput uploader (BATTERY TEST SCRIPT)
-// Includes battery power (v10) and SOC (v11)
-// Battery support is OPTIONAL and DISABLED by default
+//
+// Battery reporting uses PVOutput BATTERY FIELDS (b1 / b2)
+// A PVOutput DONATION ACCOUNT IS REQUIRED for battery data
 // -----------------------------------------------------------------------------
 
 // ======================= USER CONFIG =======================
@@ -16,9 +17,11 @@ $pvoutputSystemId = 'PUT_YOUR_PVOUTPUT_SYSTEM_ID_HERE';
 
 // ======================= OPTIONAL FEATURES =======================
 
-// ⚠️ BATTERY SUPPORT
-// Set to true ONLY if you have a battery installed and operational
+// Set to true ONLY if you have a battery installed
 $ENABLE_BATTERY = false;
+
+// Set to true ONLY if your PVOutput account is a DONATION account
+$PVOUTPUT_DONOR = false;
 
 // Set to true to enable debug logging
 $DEBUG = false;
@@ -33,9 +36,7 @@ $httpTimeout = 10;
 function logMsg(string $msg, bool $debugOnly = false): void
 {
     global $DEBUG, $logFile;
-    if ($debugOnly && $DEBUG !== true) {
-        return;
-    }
+    if ($debugOnly && $DEBUG !== true) return;
 
     file_put_contents(
         $logFile,
@@ -47,9 +48,7 @@ function logMsg(string $msg, bool $debugOnly = false): void
 function httpGetJson(string $url, int $timeout): array
 {
     $context = stream_context_create([
-        'http' => [
-            'timeout' => $timeout,
-        ]
+        'http' => ['timeout' => $timeout]
     ]);
 
     $json = @file_get_contents($url, false, $context);
@@ -136,12 +135,12 @@ try {
     );
 
     // -------------------------------------------------------------------------
-    // BATTERY SUPPORT (OPTIONAL)
+    // BATTERY DATA (OPTIONAL, DONOR ONLY)
     // -------------------------------------------------------------------------
     $batteryPower = null;
     $batterySOC   = null;
 
-    if ($ENABLE_BATTERY === true) {
+    if ($ENABLE_BATTERY === true && $PVOUTPUT_DONOR === true) {
 
         $storage = httpGetJson(
             "http://{$ipAddress}/solar_api/v1/GetStorageRealtimeData.cgi",
@@ -152,18 +151,12 @@ try {
 
         if (is_array($s)) {
 
-            // Fronius convention:
-            //   +ve = discharge
-            //   -ve = charge
-            //
-            // PVOutput expects:
-            //   +ve = charge
-            //   -ve = discharge
+            // Fronius: +ve = discharge, -ve = charge
+            // PVOutput: +ve = charge, -ve = discharge
             if (isset($s['P'])) {
                 $batteryPower = (int) round(-$s['P']);
             }
 
-            // State of Charge (%)
             if (isset($s['SOC'])) {
                 $soc = (float) $s['SOC'];
                 if ($soc >= 0 && $soc <= 100) {
@@ -188,16 +181,16 @@ try {
         'v9' => $energyConsumedToday,
     ];
 
-    if ($voltage !== null)   $data['v6']  = round($voltage, 1);
-    if ($frequency !== null) $data['v7']  = round($frequency, 2);
+    if ($voltage !== null)   $data['v6'] = round($voltage, 1);
+    if ($frequency !== null) $data['v7'] = round($frequency, 2);
 
-    // 🔋 Battery → PVOutput (only when enabled and valid)
-    if ($ENABLE_BATTERY === true && $batteryPower !== null) {
-        $data['v10'] = $batteryPower;   // Battery power (W)
+    // 🔋 Battery → PVOutput (DONOR accounts only)
+    if ($batteryPower !== null) {
+        $data['b1'] = $batteryPower;   // Battery power (W)
     }
 
-    if ($ENABLE_BATTERY === true && $batterySOC !== null) {
-        $data['v11'] = $batterySOC;     // Battery state of charge (%)
+    if ($batterySOC !== null) {
+        $data['b2'] = $batterySOC;     // Battery SOC (%)
     }
 
     logMsg('PVOutput payload: ' . json_encode($data), true);
