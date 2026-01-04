@@ -40,6 +40,51 @@ No lifetime counters, rolling deltas, or unsafe calculations are used.
 
 ---
 
+## Which script should I use?
+
+This repository provides two PHP scripts for uploading Fronius data to PVOutput.
+
+Most users should use the **standard script**. An **advanced script** is available for more complex installations.
+
+---
+
+### Standard script — `fronius.php`
+
+Use this script if:
+
+- You have **one Fronius inverter**
+- You want the **simplest and most robust setup**
+- You do not need inverter auto-detection
+
+Features:
+
+- Single inverter (manually configured)
+- Hardened and cron-safe
+- Correct PVOutput field mapping
+- Recommended for the majority of residential systems
+
+---
+
+### Advanced script — `fronius-advanced.php`
+
+Use this script if:
+
+- You have **multiple Fronius inverters**, or may add more later
+- You want **automatic inverter ID detection**
+- You are comfortable with a more advanced configuration
+
+Features:
+
+- Automatically detects all running inverters via the Fronius API
+- Aggregates power and daily energy across multiple devices
+- Fully hardened with locking and logging
+- Uses the same safe PVOutput semantics as the standard script
+
+> The advanced script contains **no hard-coded credentials**.  
+> You must supply your own inverter IP address, PVOutput API key, and System ID.
+
+---
+
 ## Configuration
 
 Edit the following values near the top of the script:
