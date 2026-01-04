@@ -1,44 +1,161 @@
-# Fronius-To-PVOutput
-Fronius To PVOutput php script
+# Fronius‑To‑PVOutput
 
+## Overview
 
-PHP Script to extract data from a Fronius Inverter and Meter and push it to PVOutput account.
-The script is designed to be run every five (5) minutes from a host computer which
-can access the inverter and access the PVOutput website. I use my Synology NAS.
-The script was tested against a Fronius Symo GEN24 10.0 3 phase system With a
-Smart Meter 63A 3 phase system
-Use it at your peril. All useful feed-back will be appreciated.
+**Fronius‑To‑PVOutput** is a hardened PHP script that extracts real‑time and daily energy data from a **Fronius inverter and Smart Meter** and uploads it to **PVOutput** using the official PVOutput v2 API.
 
-To install on your system I would google how to or ask chatGPT (https://chat.openai.com/chat)
-For a Snology Nas this is how
-You can set up a scheduled task in your Synology DSM to run the PHP script every 5 minutes. 
+The script is designed to run unattended every **5 minutes**, is safe against duplicate uploads, and has been validated against real‑world data.
 
-Here are the steps to do it:
+### Tested Hardware
 
-Open the Control Panel in your DSM and go to Task Scheduler.
-Create a new task, select "User-defined script" as the task type.
-Set a descriptive name for the task and enable it.
-In the "Task Settings" section, select "Run command" as the action and enter the following command:
+* **Fronius Symo GEN24 10.0** (3‑phase)
+* **Fronius Smart Meter 63A‑3** (3‑phase)
 
-/usr/bin/php /volume1/THE DIRECTORY YOU SAVED IT/pvoutput.php
+While it should work with other Fronius GEN24 variants and compatible Smart Meters, this repository reflects the configuration above. Use at your own risk.
 
-In the "Task Settings" section, set the task to run every 5 minutes.
-Save the task and make sure it's enabled.
+---
 
-Now the PHP script will run every 5 minutes and update the energy consumption and power consumption values to the Fronius API and then to PVOutput.
+## What Data Is Sent to PVOutput
 
-Apparently you can also use cron -e but I never got it to work.
+The script uses *authoritative Fronius API counters* and maps them correctly to PVOutput fields:
 
-To run this script using the Windows Task Scheduler, you will need to follow these steps:
+* **Instantaneous generation (W)**
+* **Daily energy generation (Wh)** — resets at midnight
+* **Instantaneous household consumption (W)**
+* **Daily household consumption (Wh)** — resets at midnight
+* **Net grid power (import/export, W)**
+* **AC voltage (V)**
+* **AC frequency (Hz)**
 
-Open the Task Scheduler by searching for it in the Start Menu or by using the Windows search bar.
-Click on the "Create Task" button to create a new task.
-In the General tab, enter a name for the task and check the "Run with highest privileges" checkbox.
-In the Triggers tab, click the "New" button to create a new trigger. Set the trigger to run the task "Daily" and set the "Start" time to when you want the task to start. Set the "Repeat task" option to "Every" 5 minutes.
-In the Actions tab, click the "New" button to create a new action. Set the "Action" to "Start a program" and browse to the location where you have saved the PHP script.
-In the "Add arguments (optional)" field, enter the URL of the PHP script (e.g., http://localhost/THE DIRECTORY YOU SAVED IT/index.php).
-You have to save the file as index.php or it wount work.
-Click on the "OK" button to save the task.
-Now, the task will run every 5 minutes and the script will be executed. If you need to make changes to the script, simply edit the file and the changes will be reflected the next time the task runs.
+No lifetime counters, rolling deltas, or unsafe calculations are used.
 
-Good luck
+---
+
+## Requirements
+
+* PHP 7.4 or later (PHP 8.x supported)
+* Network access to the Fronius inverter
+* Outbound HTTPS access to `pvoutput.org`
+* A valid **PVOutput API key** and **System ID**
+
+---
+
+## Configuration
+
+Edit the following values near the top of the script:
+
+```php
+$ipAddress = 'YOUR_INVERTER_IP_ADDRESS';
+
+$pvoutputAPIKey   = 'YOUR_API_KEY_HERE';
+$pvoutputSystemId = 'YOUR_SYSTEM_ID_HERE';
+
+$inverterId = 1;
+```
+
+> Tip: The inverter ID is usually `1`. You can confirm this via the Fronius API endpoint `GetInverterInfo.cgi`.
+
+---
+
+## Scheduling the Script
+
+The script runs correctly on **Synology NAS, Linux servers, Raspberry Pi (Zero / 2 / 3 / 4 / 5), macOS, and other Unix-like systems** where PHP is available.
+
+The script **must** be run every **5 minutes** for PVOutput to calculate import/export and self‑consumption correctly.
+
+### Synology NAS (DSM)
+
+1. Open **Control Panel → Task Scheduler**
+2. Click **Create → Scheduled Task → User‑defined script**
+3. Give the task a descriptive name and enable it
+4. Set the schedule to run **every 5 minutes**
+5. Set the time, make the last run time 23:55
+6. In **Task Settings**, choose **Run command** and enter:
+
+```bash
+/usr/bin/php /volume1/PATH/TO/fronius.php
+```
+
+6. Save the task
+
+The built‑in lockfile prevents overlapping executions.
+
+---
+
+### Linux / Unix (cron)
+
+Edit your crontab:
+
+```bash
+crontab -e
+```
+
+Add:
+
+```bash
+*/5 * * * * /usr/bin/php /path/to/fronius.php
+```
+
+No additional locking or sleeps are required.
+
+---
+
+### Windows (Task Scheduler)
+
+Windows is **not recommended**, but it is possible.
+
+1. Open **Task Scheduler**
+2. Create a new task
+3. Enable **Run with highest privileges**
+4. Set a trigger to run daily and repeat **every 5 minutes**
+5. Action: **Start a program**
+6. Program/script:
+
+```text
+C:\Path\To\php.exe
+```
+
+7. Add arguments:
+
+```text
+C:\Path\To\fronius.php
+```
+
+> Do **not** run this via a web server or browser. Run it as a CLI PHP script.
+
+---
+
+## Logging & Reliability
+
+* The script uses a **lockfile** to prevent duplicate uploads
+* Errors are written to `fronius.log` in the script directory
+* Network and API failures are handled gracefully
+* Partial or corrupt data is never submitted to PVOutput
+
+This makes the script suitable for long‑term unattended use.
+
+---
+
+## Notes & Limitations
+
+* Battery support is **not enabled** (GEN24 battery can be added later)
+* Only officially documented Fronius API fields are used
+* PVOutput free accounts are subject to standard rate limits
+
+---
+
+## Feedback & Contributions
+
+Constructive feedback and pull requests are welcome, particularly from users with:
+
+* Other GEN24 models
+* Different Fronius Smart Meters
+* Battery‑equipped systems
+
+---
+
+## Disclaimer
+
+This project is provided **as‑is**, without warranty of any kind. You are responsible for verifying correctness against your own system before relying on the data.
+
+If you are unsure, test with PVOutput set to **private** until you are confident everything behaves correctly.
