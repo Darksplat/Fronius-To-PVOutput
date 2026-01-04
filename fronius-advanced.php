@@ -1,30 +1,33 @@
 <?php
 // -----------------------------------------------------------------------------
 // Fronius GEN24 + Smart Meter → PVOutput uploader (ADVANCED)
-// - Auto-detects inverter IDs
+// - Auto-detect inverter IDs
 // - Supports multiple inverters
-// - Hardened for unattended operation
-//
-// ADVANCED USERS ONLY.
-// Most users should use fronius.php instead.
 // -----------------------------------------------------------------------------
 
-// ---------------- USER CONFIGURATION -----------------------------------------
+// ======================= USER CONFIG =======================
 
-// IP address or hostname of your Fronius inverter
+// Fronius inverter IP or hostname
 $ipAddress = 'PUT_YOUR_INVERTER_IP_ADDRESS_HERE';
 
 // PVOutput credentials
 $pvoutputAPIKey   = 'PUT_YOUR_PVOUTPUT_API_KEY_HERE';
 $pvoutputSystemId = 'PUT_YOUR_PVOUTPUT_SYSTEM_ID_HERE';
 
-// Diagnostics
-define('DEBUG', false);   // set true for troubleshooting
+// ======================= OPTIONAL FEATURES =======================
 
-// ---------------- INTERNAL CONFIG --------------------------------------------
-$lockFile = __DIR__ . '/fronius-advanced.lock';
-$logFile  = __DIR__ . '/fronius-advanced.log';
+// Set to true to enable debug logging
+$DEBUG = false;
+
+// Battery support scaffold (advanced users only)
+// Set to true ONLY if you have a battery installed
+$ENABLE_BATTERY = false;
+
+// ======================= INTERNAL CONFIG =======================
+$lockFile    = __DIR__ . '/fronius-advanced.lock';
+$logFile     = __DIR__ . '/fronius-advanced.log';
 $httpTimeout = 10;
+
 
 // ---------------- HELPERS -----------------------------------------------------
 function logMsg(string $msg, bool $debugOnly = false): void
