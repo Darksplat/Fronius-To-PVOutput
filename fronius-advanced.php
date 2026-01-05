@@ -1,31 +1,45 @@
 <?php
 // -----------------------------------------------------------------------------
-// Fronius GEN24 + Smart Meter → PVOutput uploader (DONOR ENHANCED)
+// Fronius GEN24 + Smart Meter → PVOutput uploader (ADVANCED)
 //
 // MODE: Power-integration (correct for GEN24)
 //
-// Sent to PVOutput:
-//   v2 = PV Power (W)              → Site.P_PV
+// Core PVOutput fields:
+//   v2 = PV Power (W)              → Site.P_PV  (whole-site PV power)
 //   v4 = Load Power (W)            → abs(Site.P_Load)
-//   v6 = Voltage (V)
-//   v7 = Grid Frequency (Hz)       → Smart Meter
+//   v6 = Voltage (V)               → Average UAC across detected inverters
+//
+// Optional (donor-only):
+//   v7 = Frequency (Hz)            → Smart Meter Frequency_Phase_Average
 //   v8 = Net Grid Power (W)        → Site.P_Grid
 //
-// Energy, efficiency, averages are calculated by PVOutput.
+// Features:
+//   - Auto-detect inverter IDs (no hard-coded DeviceID)
+//   - Multi-inverter ready (sums/averages where appropriate)
+//   - Debug logging toggle
 // -----------------------------------------------------------------------------
 
 // ======================= USER CONFIG =======================
 
+// Fronius inverter IP or hostname
 $ipAddress = 'PUT_YOUR_INVERTER_IP_ADDRESS_HERE';
 
+// PVOutput credentials
 $pvoutputAPIKey   = 'PUT_YOUR_PVOUTPUT_API_KEY_HERE';
 $pvoutputSystemId = 'PUT_YOUR_PVOUTPUT_SYSTEM_ID_HERE';
 
+// ======================= FEATURE TOGGLES =======================
+
+// Enable debug logging (writes payloads and extra details)
 $DEBUG = false;
 
+// Donor features (set true only if your PVOutput system supports these)
+$ENABLE_V7_FREQUENCY = false;  // v7
+$ENABLE_V8_GRIDPOWER  = false;  // v8
+
 // ======================= INTERNAL CONFIG =======================
-$lockFile    = __DIR__ . '/fronius-donor.lock';
-$logFile     = __DIR__ . '/fronius-donor.log';
+$lockFile    = __DIR__ . '/fronius-advanced.lock';
+$logFile     = __DIR__ . '/fronius-advanced.log';
 $httpTimeout = 10;
 
 // ---------------- HELPERS -----------------------------------------------------
@@ -53,6 +67,13 @@ function httpGetJson(string $url, int $timeout): array
     return $data;
 }
 
+function safeFloat($v): ?float
+{
+    if ($v === null) return null;
+    if (is_numeric($v)) return (float) $v;
+    return null;
+}
+
 // ---------------- LOCKFILE ----------------------------------------------------
 $lockHandle = fopen($lockFile, 'c');
 if ($lockHandle === false || !flock($lockHandle, LOCK_EX | LOCK_NB)) exit;
@@ -70,7 +91,7 @@ $time = date('H:i');
 try {
 
     // -------------------------------------------------------------------------
-    // POWER FLOW DATA (PV, LOAD, GRID)
+    // POWER FLOW (SITE TOTALS: PV, LOAD, GRID)
     // -------------------------------------------------------------------------
     $pf = httpGetJson(
         "http://{$ipAddress}/solar_api/v1/GetPowerFlowRealtimeData.fcgi",
@@ -80,53 +101,89 @@ try {
     $site = $pf['Body']['Data']['Site'] ?? null;
     if (!is_array($site)) throw new RuntimeException('Missing PowerFlow Site data');
 
-    $pvPowerW   = (int) round((float) ($site['P_PV']   ?? 0));
+    $pvPowerW   = (int) round((float) ($site['P_PV'] ?? 0));
     $loadPowerW = (int) round(abs((float) ($site['P_Load'] ?? 0)));
     $gridPowerW = (int) round((float) ($site['P_Grid'] ?? 0));
 
     // -------------------------------------------------------------------------
-    // INVERTER DATA (VOLTAGE)
+    // AUTO-DETECT INVERTER IDS (for voltage averaging)
     // -------------------------------------------------------------------------
-    $inv = httpGetJson(
+    $invCommon = httpGetJson(
         "http://{$ipAddress}/solar_api/v1/GetInverterRealtimeData.cgi" .
-        "?Scope=Device&DeviceID=1&DataCollection=CommonInverterData",
+        "?Scope=System&DataCollection=CommonInverterData",
         $httpTimeout
     );
 
-    $invData  = $inv['Body']['Data'] ?? [];
-    $voltageV = $invData['UAC']['Value'] ?? null;
+    // Expected structure (System scope):
+    // Body.Data.<key>.Values is a map of inverterId => value
+    $dataSys = $invCommon['Body']['Data'] ?? null;
+    if (!is_array($dataSys)) throw new RuntimeException('Missing inverter system data');
+
+    // Find inverter IDs from PAC.Values (most reliable map)
+    $pacValues = $dataSys['PAC']['Values'] ?? null;
+    if (!is_array($pacValues) || count($pacValues) === 0) {
+        throw new RuntimeException('Unable to detect inverter IDs (PAC.Values empty)');
+    }
+
+    $inverterIds = array_keys($pacValues);
 
     // -------------------------------------------------------------------------
-    // SMART METER DATA (FREQUENCY)
+    // VOLTAGE: average UAC across detected inverters
     // -------------------------------------------------------------------------
-    $meter = httpGetJson(
-        "http://{$ipAddress}/solar_api/v1/GetMeterRealtimeData.cgi?Scope=Device&DeviceId=0",
-        $httpTimeout
-    );
+    $uacValues = $dataSys['UAC']['Values'] ?? null;
+    $voltageV = null;
 
-    $m = $meter['Body']['Data']['0'] ?? [];
-    $frequencyHz = $m['Frequency_Phase_Average'] ?? null;
+    if (is_array($uacValues) && count($uacValues) > 0) {
+        $sum = 0.0;
+        $cnt = 0;
+        foreach ($inverterIds as $id) {
+            if (isset($uacValues[$id]) && is_numeric($uacValues[$id])) {
+                $sum += (float) $uacValues[$id];
+                $cnt++;
+            }
+        }
+        if ($cnt > 0) $voltageV = $sum / $cnt;
+    }
+
+    // -------------------------------------------------------------------------
+    // OPTIONAL: Smart Meter Frequency (v7)
+    // -------------------------------------------------------------------------
+    $frequencyHz = null;
+    if ($ENABLE_V7_FREQUENCY === true) {
+        $meter = httpGetJson(
+            "http://{$ipAddress}/solar_api/v1/GetMeterRealtimeData.cgi?Scope=Device&DeviceId=0",
+            $httpTimeout
+        );
+        $m0 = $meter['Body']['Data']['0'] ?? null;
+        if (is_array($m0) && isset($m0['Frequency_Phase_Average']) && is_numeric($m0['Frequency_Phase_Average'])) {
+            $frequencyHz = (float) $m0['Frequency_Phase_Average'];
+        }
+    }
 
     // -------------------------------------------------------------------------
     // PVOUTPUT PAYLOAD
     // -------------------------------------------------------------------------
-    $data = [
+    $payload = [
         'd'  => $date,
         't'  => $time,
         'v2' => $pvPowerW,
         'v4' => $loadPowerW,
-        'v8' => $gridPowerW,
     ];
 
     if ($voltageV !== null) {
-        $data['v6'] = round((float) $voltageV, 1);
+        $payload['v6'] = round((float) $voltageV, 1);
     }
 
-    if ($frequencyHz !== null) {
-        $data['v7'] = round((float) $frequencyHz, 2);
+    if ($ENABLE_V8_GRIDPOWER === true) {
+        $payload['v8'] = $gridPowerW;
     }
 
-    logMsg('PVOutput payload: ' . json_encode($data), true);
+    if ($ENABLE_V7_FREQUENCY === true && $frequencyHz !== null) {
+        $payload['v7'] = round((float) $frequencyHz, 2);
+    }
+
+    logMsg('Detected inverter IDs: ' . json_encode($inverterIds), true);
+    logMsg('PVOutput payload: ' . json_encode($payload), true);
 
     // -------------------------------------------------------------------------
     // SEND TO PVOUTPUT
@@ -137,7 +194,7 @@ try {
             'header'  =>
                 "X-Pvoutput-Apikey: {$pvoutputAPIKey}\r\n" .
                 "X-Pvoutput-SystemId: {$pvoutputSystemId}\r\n",
-            'content' => http_build_query($data),
+            'content' => http_build_query($payload),
             'timeout' => $httpTimeout,
         ]
     ]);
